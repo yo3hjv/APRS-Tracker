@@ -1,0 +1,453 @@
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/*
+
+This is a sketch for a simple and compact APRS tracker.
+It runs on a Arduino UNO or NANO with the add of a small  SSD1306 LCD display.
+The transceiver is a DORJI 818V but with a little work can be any other
+
+May 2016
+Adrian YO3HJV
+yo3hjv@gmail.com
+
+Thanks to:
+-Mark Qvist - LibAPRS
+-LZ1PPL for ideea and parts of code
+
+This is 4.1 revision.
+Implemented on a MicroModem board.
+Published under "Beerware License 2.2 (2 beers for me, 2 beers for you)
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////*/
+
+
+
+#include <LibAPRS.h>
+#include "U8glib.h"
+#include <TinyGPS++.h>
+
+TinyGPSPlus gps;
+
+U8GLIB_SSD1306_128X64 u8g(U8G_I2C_OPT_NONE);    /////  128x64 OLED SSD1306 display
+
+unsigned int txCounter = 0;
+unsigned long lastTx = 0;
+char nw, wl;
+boolean gotPacket = false;
+AX25Msg incomingPacket;
+uint8_t *packetData;
+float lastTxLat = 0.00;
+float lastTxLng = 0.00;
+float lastTxdistance = 0.0;
+int previousHeading = 400;
+int lastbearing = 0;
+int headingDelta, lastheadingDelta = 0;
+byte hour = 0, minute = 0, second = 0;
+unsigned long secondtimer = 0;
+unsigned long timer = 0;
+boolean paket = false;
+
+
+      int ChangePage = 1;
+      int forceTx = 1;
+
+      int pge = 12;             // MISO to GND, Normally OPEN. Close to GND change page after valid packet is received.
+      int ftx = 11;             // MOSI to GND, Normally OPEN. Close to GND to force Tx whenever is pressed.
+
+int ptt = 3;               //PTT
+
+#define ADC_REFERENCE REF_3V3
+#define OPEN_SQUELCH true
+
+void setup()
+{
+  pinMode(pge, INPUT_PULLUP);  // Change page after a valid packet is received              
+  pinMode(ftx, INPUT_PULLUP);  // Force Tx               
+  
+
+  pinMode(ptt, OUTPUT);        //  PTT, LOW on TX, according to DORJI docs.
+  
+  Serial.begin(9600);
+  
+     setDorji();
+
+  
+                                             // Initialise APRS library - This starts the modem
+  APRS_init(ADC_REFERENCE, OPEN_SQUELCH);
+  APRS_setCallsign("YO3HJV", 9);             // CALLSIGN and SSID
+  APRS_setSymbol('>');                       // SYMBOL.  > for CAR
+  APRS_setDestination("APMT01", 0);          // APRS Packet destination
+  APRS_setPath1("WIDE1", 1);                 // PATH
+  APRS_setPath2("WIDE2", 1);                 // PATH
+  
+  APRS_setPreamble(1000);                   // Set APRS Preamble
+  APRS_setTail(150);                        // Set APRS tail
+}
+
+
+
+
+
+
+void loop()
+{
+
+      forceTx = digitalRead(ftx);                      // Force Tx even without GPS fix. Good for testing.
+
+     if (forceTx == LOW)
+         {
+            TxtoRadio();
+          }
+
+         else{}
+
+      
+  if (millis() - secondtimer >= 1000)     // No GPS time
+    {
+    second++;
+    secondtimer = millis();
+    if (second == 60)
+    {
+      second = 0;
+      minute++;
+      if (minute == 60)
+      {
+        minute = 0;
+        hour++;
+        if (hour == 24)
+        {
+          hour = 0;
+        }
+      }
+    }
+  }
+
+  while (Serial.available() > 0)         // GPS send NMEA
+    {
+    gps.encode(Serial.read()); 
+    }
+
+     if ( gps.time.isUpdated() )         // Load variables with GPS time
+        {
+          hour = (gps.time.hour()+ 3);   // Here we add or substract Local time Offset. +3 Bucharest, Athens etc.
+          minute = gps.time.minute();
+          second = gps.time.second();
+        }
+
+
+ //////////////// We have GPS position. We do APRS stuff ///////////////////
+ 
+  if ( gps.location.isUpdated() )
+  {
+
+    lastTxdistance = TinyGPSPlus::distanceBetween(
+                       gps.location.lat(),
+                       gps.location.lng(),
+                       lastTxLat,
+                       lastTxLng);
+
+    lastbearing = (int)TinyGPSPlus::courseTo(
+                    lastTxLat,
+                    lastTxLng,
+                    gps.location.lat(),
+                    gps.location.lng());
+
+    nw = gps.location.rawLat().negative ? 'S' : 'N';
+    wl = gps.location.rawLng().negative ? 'W' : 'E';
+    // Get headings and heading delta
+
+    headingDelta = abs(lastbearing - (int)gps.course.deg());
+    if (headingDelta  > 180)
+    {
+      headingDelta  = 360 - headingDelta;
+    }
+
+    lastheadingDelta = abs(lastbearing - previousHeading);
+    if (lastheadingDelta > 180)
+    {
+      lastheadingDelta = 360 - lastheadingDelta;
+    }
+
+  } // endof gps.location.isUpdated()
+
+
+
+  long latt, lonn;
+                   ///////////////////////////   Maidenhead locator from GPS position /////////////////////////////
+
+                              
+  lonn = (gps.location.lng() * 100000) + 18000000; // Step 1
+  latt = (gps.location.lat() * 100000) + 9000000; // Adjust so Locn AA is at the pole
+  char MH[6] = {'A', 'A', '0', '0', 'a', 'a'}; // Initialise our print string
+  MH[0] += lonn / 2000000; // Field
+  MH[1] += latt / 1000000;
+  MH[2] += (lonn % 2000000) / 200000; // Square
+  MH[3] += (latt % 1000000) / 100000;
+  MH[4] += (lonn % 200000) / 8333; // Subsquare .08333 is 5/60
+  MH[5] += (latt % 100000) / 4166; // .04166 is 2.5/60
+  String MH_txt = ""; // Build up Maidenhead
+  int i = 0; // into a string that's easy to print
+  while (i < 6)
+  {
+    MH_txt += MH[i];
+    i++;
+  }
+                       //////////   END of Maidenhead locator computing ///////////////////
+
+  ChangePage = digitalRead(pge);
+  
+            if (gotPacket)
+                {
+                   paket = true;
+                }
+
+                
+     if (paket == true)
+            {
+               if (gotPacket) {
+                 gotPacket = false;        
+        u8g.firstPage();
+    
+      do
+      {                               ///////////////////////////  SHOW what we got in the packet! //////////////////////
+        u8g.setFont(u8g_font_6x12);
+        u8g.setPrintPos(0, 12);
+        printTime();
+        
+        u8g.setPrintPos(60, 9);
+        u8g.print(incomingPacket.src.call);
+        if (incomingPacket.src.ssid > 0)
+        {
+          u8g.print(F("-"));
+          u8g.print(incomingPacket.src.ssid);
+        } 
+        u8g.setPrintPos(0, 27);
+        for (int i = 1; i < incomingPacket.len; i++)
+        {
+          u8g.print(char(incomingPacket.info[i]));
+          if (i == 23)
+          {
+            u8g.setPrintPos(0, 36);
+          }
+          if (i == 46)
+          {
+            u8g.setPrintPos(0, 45);
+          }
+          if (i == 69)
+          {
+            u8g.setPrintPos(0, 54);
+          }
+          if (i == 92)
+          {
+            u8g.setPrintPos(0, 63);
+          }
+        }
+      }
+      while ( u8g.nextPage() );
+    }
+  }
+
+  
+  else
+  {
+    u8g.firstPage();
+    do
+    { 
+      u8g.setFont(u8g_font_6x12);
+
+                             ///////////  SHOW Time ////////////
+      u8g.setPrintPos(0, 12);
+           printTime();
+          
+                            //////////// SHOW nr. of Satellites //////////////
+      u8g.setPrintPos(70, 12);
+      u8g.print(F("SAT's: "));
+      u8g.print(gps.satellites.value());
+                           ////////////  SHOW Speed //////////////////////////
+      u8g.setPrintPos(0, 24);
+      u8g.print(gps.speed.kmph(), 2);
+      u8g.print(F(" Km/H"));
+                           ////////////  SHOW HDOP - Precision ///////////////
+      u8g.setPrintPos(70, 24);
+      u8g.print(F("HDOP: "));
+      u8g.print(gps.hdop.value()/100);  // HDOP value as integer from  0-99. 1-5 means very good precision!
+      
+                          ////////////   SHOW LAT/LONG and Maidenhead LOCATOR //////////////////////
+      u8g.setPrintPos(0, 36);
+      u8g.print(F("LAT: "));
+      u8g.print(gps.location.lat(), 6);
+      u8g.setPrintPos(0, 48);
+      u8g.print(F("LON: "));
+      u8g.print(gps.location.lng(), 6);
+      u8g.setPrintPos(0, 60);
+      u8g.print(F("LOCATOR: "));
+      u8g.print(MH_txt);
+    }
+    while ( u8g.nextPage() );
+  }
+                             /// if Change Page button is pressed  ////
+  if (ChangePage == LOW)
+  {
+    paket = false;
+  }
+
+
+  ////////////////////////////////////////////////////////////////////////////////////
+  // Check for when to Tx packet
+  ////////////////////////////////////////////////////////////////////////////////////
+
+
+                        /////////   Only for minimum 3 sats in view and a good precision (HDOP<500)  //////////////
+  if ( gps.satellites.value() >= 3 && (millis() - lastTx) > 15000 && gps.hdop.value() < 500 )
+  {                                                                                                 
+
+    //////////////////////////////////////////  SMARTBEACONING PARAMETERS  //////////////////////////////////////////////////////////
+    
+    // Check for heading between 70 and 95degrees in more than 50m and previousHeading is defined (for left or right turn)
+    if ( headingDelta > 70 && headingDelta < 95 && lastheadingDelta > 50 && lastTxdistance > 50 && previousHeading != 400)
+    {
+      TxtoRadio();
+    } // endif headingDelta
+
+    // if headingdelta < 95 deg last Tx distance is more than 100m+ 4 x Speed lower than 60 KM/h OR lastdistance is more than 600m
+    // if more than 110 deg + 500 meter
+    else if ( (headingDelta < 95 && lastTxdistance > ( 100 + (gps.speed.kmph() * 4) + gps.hdop.value()) && gps.speed.kmph() < 60) || (lastTxdistance > 600  && gps.speed.kmph() < 60))
+    {
+      TxtoRadio();
+    }
+
+    // lastTxdistance >= 10 x Speed in Km/H and speed more than 60 Km/H = minimum 600m
+    else if ( lastTxdistance > (gps.speed.kmph() * 10) && gps.speed.kmph() >= 60 )
+    {
+      TxtoRadio();
+    }
+
+    ////////////////////////////////////////////////////////  END OF SMARTBEACONING ///////////////////////////////////////////////////////////////////
+
+    else if ( (millis() - lastTx) > 600000)        // Fixed time beacon 10 min for me.
+    {
+      TxtoRadio();
+    } // endif of check for lastTx > txInterval
+  } // Endif check for satellites
+
+
+                                       
+
+  
+}  //// END of void(loop)
+
+
+
+
+void setDorji()
+{
+    
+  Serial.println(F("AT+DMOSETGROUP=1,144.8000,144.8000,0000,0,0000"));   // Set BW 25kHz, Tx and Rx, No CTCSS
+  delay(100);
+  Serial.println(F("AT+DMOSETVOLUME=6"));
+  delay(100);
+  Serial.println(F("AT+SETFILTER=1,1,1"));                              // Set YES DE/PRE De-emphasis
+  delay(100);
+}
+
+void TxtoRadio()
+{
+    digitalWrite(ptt, HIGH);                 // We put this on HIGH beacause we have a transistor there...
+    delay(800);                              // Wait a little for the transmitter to be OK
+    char latOut[15], lngOutTmp[15];
+    float latDegMin, lngDegMin = 0.0;
+    latDegMin = convertDegMin(gps.location.lat());
+    lngDegMin = convertDegMin(gps.location.lng());
+    dtostrf(latDegMin, 2, 2, latOut );
+    dtostrf(lngDegMin, 2, 2, lngOutTmp );
+
+    char lngOut[15] = {
+    };
+    int cur_len = strlen(latOut);
+    latOut[cur_len] = nw;
+    latOut[cur_len + 1] = '\0';
+
+    if (lngDegMin < 10000)
+    {
+      int n = strlen(lngOutTmp);
+      lngOut[0] = '0';
+      for (int i = 1; i < n + 1; i++)
+      {
+        lngOut[i] = lngOutTmp[i - 1];
+      }
+      cur_len = strlen(lngOut);
+      lngOut[cur_len] = '\0';
+    }
+    else {
+      strncpy(lngOut, lngOutTmp, 15);
+    }
+
+    lngOut[cur_len] = wl;
+    lngOut[cur_len + 1] = '\0';
+
+    APRS_setLat(latOut);
+    APRS_setLon(lngOut);
+ 
+    int iiii = txCounter;
+    char strii[10];
+    sprintf(strii, "%d", iiii);
+    char *comment = strii;
+
+    APRS_setPower(1);
+    APRS_setHeight(0);
+    APRS_setGain(3);
+    APRS_setDirectivity(0);
+
+    APRS_sendLoc(comment, strlen(comment));
+    APRS_sendLoc(comment, strlen(comment));
+
+    delay(100);                             // I don't know why, just in case
+    digitalWrite(ptt, LOW);                 /// Ajunge cat am emis cacaturi, acum ne odihnim
+
+    ////////////////////////// Reset the Tx interval //////////////////////
+    lastTxdistance = 0;
+    lastTxLat = gps.location.lat();
+    lastTxLng = gps.location.lng();
+    previousHeading = lastbearing;
+  lastTx = millis();
+  txCounter++;
+
+} // endof TxtoRadio()
+
+
+
+void aprs_msg_callback(struct AX25Msg *msg)
+{
+  if (!gotPacket)
+  {
+    gotPacket = true;
+    memcpy(&incomingPacket, msg, sizeof(AX25Msg));
+  }
+}
+
+
+
+float convertDegMin(float decDeg)
+{
+  float DegMin;
+  int intDeg = decDeg;
+  decDeg -= intDeg;
+  decDeg *= 60;
+  DegMin = ( intDeg * 100 ) + decDeg;
+  return DegMin;
+}
+
+static void printTime()
+{
+  if (hour < 10)
+    u8g.print(F("0"));
+  u8g.print(hour);
+  u8g.print(F(":"));
+  if (minute < 10)
+    u8g.print(F("0"));
+  u8g.print(minute);
+  u8g.print(F(":"));
+  if (second < 10)
+    u8g.print(F("0"));
+  u8g.print(second);
+}
